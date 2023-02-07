@@ -13,7 +13,6 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 from lm_eval.tasks import ALL_TASKS
-from pretrain_gpt import model_provider
 import numpy as np
 
 import torch
@@ -141,7 +140,7 @@ class EvalHarnessAdaptor(GPT2LM):
                 for _, context_enc, continuation_enc in chunk:
                     # when too long to fit in context, truncate from the left
                     inp = torch.tensor(
-                        (context_enc + continuation_enc)[-(self.max_length + 1):][:-1]
+                        ([50257] + context_enc + continuation_enc)[-(self.max_length + 1):][:-1]
                         , dtype=torch.long).to(self.device)
                     inplen, = inp.shape
 
@@ -162,7 +161,9 @@ class EvalHarnessAdaptor(GPT2LM):
                     contlens.append(cont)
                     inplens.append(inplen)
 
-                logits = self._model_call(torch.cat(inps, dim=0))
+                # contlens stores contencs not contlens, but not changing the variable names for consistency
+                prefix_lens = torch.tensor([ilen - len(ctoks) for ilen, ctoks in zip(inplens, contlens)])[:, None]
+                logits = self._model_call(torch.cat(inps, dim=0), prefix_lens=prefix_lens)
                 res_len += len(chunk)
                 if logits is not None:
                     multi_logits = F.log_softmax(logits, dim=-1).cpu()  # [batch, seq, vocab]
@@ -192,6 +193,10 @@ class EvalHarnessAdaptor(GPT2LM):
 
     def create_model_inputs(self, tokens):
         args = get_args()
+        
+        if args.prefix:
+            assert len(tokens) == 2
+            tokens, prefix_lens = tokens
 
         attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
             tokens,
@@ -202,9 +207,16 @@ class EvalHarnessAdaptor(GPT2LM):
             prefix_indices=None,
             loss_on_targets_only=False)
 
+        if args.prefix:
+            assert len(prefix_lens) == attention_mask.shape[0] == tokens.shape[0]
+            for i, prefix_len in enumerate(prefix_lens):
+                assert prefix_len <= attention_mask.shape[-1]
+                # Attention is paid to False (True ones are masked out)
+                attention_mask[i, :, :prefix_len, :prefix_len] = False
+
         return (tokens, position_ids, attention_mask), (tokens, loss_mask)
 
-    def _model_call(self, inps):
+    def _model_call(self, inps, prefix_lens=None):
         args = get_args()
 
         if args.deepspeed:
@@ -213,7 +225,15 @@ class EvalHarnessAdaptor(GPT2LM):
             new_size = ((len(inps) + args.micro_batch_size-1)  // args.micro_batch_size) * args.micro_batch_size
             padded = F.pad(inps, (0, 0, 0, new_size-len(inps)), value = 0)
             # dummy data iterator for pipelining.
-            data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, args.micro_batch_size)))
+            if args.prefix:
+                assert prefix_lens.shape == (padded.shape[0], 1)
+                data_iterator = [(torch.stack(inp), torch.stack(pfx)) for inp, pfx in zip(
+                            utils.chunks(padded, args.micro_batch_size),
+                            utils.chunks(prefix_lens, args.micro_batch_size), 
+                        )
+                ]
+            else:
+                data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, args.micro_batch_size)))
             self.model.micro_batches = len(data_iterator)
             
             if self.adaptive_seq_len:
@@ -350,6 +370,13 @@ def load_ds_checkpoint_and_setup_megatron(args):
 
     # print final arguments.
     _print_args(args)
+
+    # I think we need this to avoid fused kernels with causal attention being used in the case of pretrain_gpt
+    if args.prefix:
+        from finetune_t0_non_causal_decoder import model_provider
+    else:
+        from pretrain_gpt import model_provider
+
     if args.deepspeed:
 
         # Hack #3:
@@ -395,10 +422,12 @@ def tasks_args(parser):
     group.add_argument('--adaptive_seq_len',  default = False, action='store_true',
                        help='Should the sequence length be adapted to the batch during evaluation, if in fp16 the results will be slightly different due to numerical errors but greatly speed up evaluation.')
     group.add_argument('--eval_fp32',  default = False, action='store_true', help='Should the evaluation run in fp32')
+    group.add_argument('--prefix',  default=False, action='store_true', help='Prefix LM - Bidirectional att over input')
     group.add_argument('--intermed_results',  default = False, action='store_true', help='Whether to print & write intermediate results for each task')
     group.add_argument('--bootstrap_iters', type=int, default=100000, help='How many iterations to use for stderr estimation')
     group.add_argument('--micro_bs_multiplier', type=int, default=1, help='Increase the global batch size to remove bubble when pipeline parallel')
     group.add_argument('--add_denoiser',  default = False, action='store_true', help='Whether to add a denoiser to the model')
+    group.add_argument('--fewshots', type=int, default=0, help='Num fewshots')
     return parser
 
 from megatron.global_vars import _parse_args
@@ -407,6 +436,9 @@ def main():
     # parse the megatron args. But wait with initalizing megatron.
     # avoid printing the arguments, since they will later be overridden.
     args = _parse_args(tasks_args)
+    if os.path.exists(args.results_path):
+        print("Exists ", args.results_path)
+        exit()
     load_path = args.load
     model = load_ds_checkpoint_and_setup_megatron(args)
 
@@ -431,11 +463,11 @@ def main():
         global_results = {"results": {}, "versions": {}}
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
         iteration_id = load_path.split("/")[-1].replace("/", "")
-        results_path = args.results_path.replace(".json", f"_lm-eval_{iteration_id}_{timestamp}.json")
+        results_path = args.results_path#.replace(".json", f"_lm-eval_{iteration_id}_{timestamp}_{args.fewshots}shots.json")
         # Backup file in case of interruption during writing
-        results_path_backup = args.results_path.replace(".json", f"_lm-eval_{iteration_id}_{timestamp}_backup.json")
+        results_path_backup = args.results_path.replace(".json", f"_lm-eval_{iteration_id}_{timestamp}_{args.fewshots}shots_backup.json")
         for task_name, task in task_dict.items():
-            results = evaluator.evaluate(adaptor, {task_name: task}, False, 0, None, bootstrap_iters=args.bootstrap_iters)
+            results = evaluator.evaluate(adaptor, {task_name: task}, False, args.fewshots, None, bootstrap_iters=args.bootstrap_iters)
             global_results["results"] = {**global_results["results"], **results["results"]}
             global_results["versions"] = {**global_results["versions"], **results["versions"]}
             if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
@@ -445,7 +477,7 @@ def main():
                 with open(results_path_backup, 'w') as outfile:
                     json.dump(global_results, outfile, indent=4)
     else:
-        global_results = evaluator.evaluate(adaptor, task_dict, False, 0, None, bootstrap_iters=args.bootstrap_iters)
+        global_results = evaluator.evaluate(adaptor, task_dict, False, args.fewshots, None, bootstrap_iters=args.bootstrap_iters)
         if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
             print(json.dumps(global_results, indent=2))
             with open(args.results_path, 'w') as outfile:
